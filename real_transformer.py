@@ -393,8 +393,8 @@ def create_dataloader(
     sampler = (
             DistributedSampler(dataset) if is_distributed else None
         )
-    pad_token = "<pad>"
-    pad_index = en_vocab[pad_token]  #MJ  the pad token index
+    # pad_token = "<pad>"
+    # pad_index = en_vocab[pad_token]  #MJ  the pad token index
     
     collate_fn = get_collate_fn(device, pad_index) #MJ: add padding indices to the token sequence and move it to device
      
@@ -708,7 +708,7 @@ class PositionalEmbedding(nn.Module):
         # Generate position indices [0, 1, 2, ..., seq_length - 1]
         seq_length = x.size(1)
         pos = torch.arange(seq_length).unsqueeze(0)  # shape (1, seq_length)
-        pos_emb = self.pe(pos)
+        pos_emb = self.pe( pos.to(x.device) )
         return x + pos_emb #MJ: x: word-embedding vector: [B,seq_length, d_mdoel]
 
 # %%
@@ -777,6 +777,8 @@ class DecoderLayer(nn.Module):
     def forward(self, x, enc_output, src_mask, tgt_mask):
         attn_output = self.self_attn(x, x, x, tgt_mask)
         x = self.norm1(x + self.dropout(attn_output))
+        
+        #MJ: def forward(self, Q, K, V, mask=None):
         attn_output = self.cross_attn(x, enc_output, enc_output, src_mask)
         x = self.norm2(x + self.dropout(attn_output))
         ff_output = self.feed_forward(x)
@@ -808,7 +810,7 @@ class Transformer(nn.Module):
 
     def generate_mask(self, src, tgt_x):
         src_mask = (src != self.pad).unsqueeze(1).unsqueeze(2)  #MJ: crc: [1, L] => src_mask: [B, 1, 1, L]
-        tgt_mask = (tgt_x != self.pad).unsqueeze(1).unsqueeze(3)   #MJ:tgt: [1, 1] => tgt_mask: [B, 1, 1, 1] in inference
+        tgt_mask = (tgt_x != self.pad ).unsqueeze(1).unsqueeze(3)   #MJ:tgt: [1, 1] => tgt_mask: [B, 1, 1, 1] in inference
         # (batch_size, seq_length) to (batch_size, 1, seq_length). 
         # => (batch_size, 1, seq_length) to (batch_size, 1, seq_length, 1).
         #MJ: the attention mechanism (which often works with 4D tensors in the form of
@@ -819,6 +821,7 @@ class Transformer(nn.Module):
         
         seq_length = tgt_x.size(1) #MJ= 8; to ensure that the model does not "peek" at future tokens when making predictions for the current token.
         nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)).bool()
+        nopeak_mask = nopeak_mask.to(tgt_mask.device)
         tgt_mask = tgt_mask & nopeak_mask
         return src_mask, tgt_mask  #MJ: peek: to look quickly or secretly at something, often without permission or in a way that is not meant to be seen
 
@@ -836,10 +839,8 @@ class Transformer(nn.Module):
         for dec_layer in self.decoder_layers:
             dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
 
-        output = self.fc(dec_output) #MJ: The same as Generator in Harvard tutorial
-        #MJ: This tutorial does not use log_softmax(self.fc(x), dim=-1), because it is handled by the CrossEntropy function self
-        #return output  #MJ: torch.Size([80, 8, 11])
-    
+        output = self.fc(dec_output) 
+            
         return  log_softmax( output, dim=-1)  #MJ: added to use the KLDiv loss
     #MJ: Added for the inference
     # self.encoder( self.src_embed(src), src_mask)
@@ -887,7 +888,7 @@ class Transformer(nn.Module):
 
 # %%
 class Batch:
-    """Object for holding a batch of data **with source and target masks**"""
+    """Object for holding a batch of data with ntokens"""
 
 # Index 0: <unk>
 # Index 1: <pad>
@@ -902,10 +903,12 @@ class Batch:
         # this src_mask is used to prevent the model from attending to padding tokens in the source sequence. 
         # self.src_mask = (src != pad).unsqueeze(-2) creates a mask that identifies non-padding tokens in the source sequence.
         if tgt is not None:
-            self.tgt = tgt[:, :-1]  #MJ: tgt.shape=(batch_size,seq_length);  tgt[:, :-1] : (batch_size, seq_length - 1) = the right shifted output.
+            self.tgt = tgt
+            self.tgt_x = tgt[:, :-1]  #MJ: tgt.shape=(batch_size,seq_length);  tgt[:, :-1] : (batch_size, seq_length - 1) = the right shifted output.
                                     #MJ: the decoder input seq= [<sos<,1,2,3...n], excluding the last token; tgt[:,0]= <sos>, tgt[]0,-1]=<eos>
             self.tgt_y = tgt[:, 1:]  #MJ:the decoder target seq = tgt_y = tgt[:, 1:] =<1,2,3...,<eos>]:  excluding the first token
-            self.tgt_mask = self.make_std_mask(self.tgt, pad)
+            #self.tgt_mask = self.make_std_mask(self.tgt, pad)
+            
             self.ntokens = (self.tgt_y != pad).data.sum()
             
 # Example Recap:
@@ -967,56 +970,68 @@ class LabelSmoothing(nn.Module):
         #MJ: nn.KLDivLoss in PyTorch requires the input to be in the form of log-probabilities and the target to be in the form of probabilities.
         
         self.padding_idx = padding_idx
-        self.confidence = 1.0 - smoothing
+        self.confidence = 1.0 - smoothing  #MJ: 1.0 - 0.1 = 0.9
         self.smoothing = smoothing
         self.size = size
         self.true_dist = None
 
-    def forward(self, x, target):
-        assert x.size(1) == self.size  # size=Vocab-size
+    def forward(self, out, target): #MJ: out: [180,5893], [250,5893] target: [180], [250], 250 = 10 * 25 = B * Seq
+        assert out.size(1) == self.size, "out.size(1) == self.size_vocab"  # size=Vocab-size
         #MJ: Dimension 0 corresponds to each example in the batch.
         #    Dimension 1 corresponds to the possible classes for each example.
-        true_dist = x.data.clone()
+        true_dist = out.data.clone()
         true_dist.fill_(self.smoothing / (self.size - 2)) 
         #MJ: The denominator (self.size - 2) indicates the number of non-true and non-padding classes.
         # The true class will receive a different probability (higher confidence value).
         # The padding class should receive a probability of zero.
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)  #MJ: target = [2, 0, 3, 1]  # For batch size B = 4
+        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)  #MJ:scatter_(dim, index, value): target = [2, 0, 3, 1]  # For batch size B = 4
+        #f target = [2, 0, 3, 1] and batch size = 4, then target.data.unsqueeze(1) will produce [[2], [0], [3], [1]], specifying one target class for each example in the batch.
         true_dist[:, self.padding_idx] = 0
         
         mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
-            #0 = dim => Here, dim=0 refers to the batch dimension, so the line sets all values in the specified rows (those where the target was equal to the padding index) to 0.0.
-            
-            #MJ: mask.squeeze() removes any singleton dimensions from mask, converting it from a shape like [N, 1] to [N] (where N is the number of found indices).
-            #mask.squeeze(): This removes all dimensions of size 1 from the tensor mask. It removes singleton dimensions along all axes.
-            
     #     target = [3, 0, 2, 0]
     #     self.padding_idx = 0
     # ==>
     #     target.data == self.padding_idx -> [False, True, False, True]
     #     mask -> [[1], [3]]
 
+        
+        if mask.dim() > 0:
+            true_dist.index_fill_(0, mask.squeeze(), 0.0)
+            #index_fill_(dim, index, value): 0 = dim => Here, dim=0 refers to the batch dimension, 
+            # so the line sets all values in the specified rows (those where the target was equal to the padding index) to 0.0.
+            
+            #MJ: mask.squeeze() removes any singleton dimensions from mask, converting it from a shape like [N, 1] to [N] (where N is the number of found indices).
+            #mask.squeeze(): This removes all dimensions of size 1 from the tensor mask. It removes singleton dimensions along all axes.
+            
+    
         self.true_dist = true_dist
-        return self.criterion(x, true_dist.clone().detach())
+        return self.criterion(out, true_dist.clone().detach())
 
 # %%
 class SimpleLossCompute:
     "A simple loss compute and train function."
 
-    def __init__(self, generator, criterion):
+    def __init__(self, criterion):
          
-        self.generator = generator  #MJ: generator is the transformer model
-        self.criterion = criterion
+           self.criterion = criterion
 
-    def __call__(self, x, y, norm):
-        out = self.generator(x)
-       
+    def __call__(self, out, tgt_y, norm): #MJ: out:[10,25,5893];tgt_y:[10,25] =[B, Seq]
+       #MJ: out = self.generator(x)
+       #MJ: Some operations in PyTorch may return non-contiguous tensors, and certain operations (like view) require a contiguous memory layout.
+       # Calling contiguous() makes sure that the tensor is suitable for reshaping with view.
         sloss = (
             self.criterion(
-                out.contiguous().view(-1, out.size(-1)), y.contiguous().view(-1)
-            )
+                out.contiguous().view(-1, out.size(-1)), tgt_y.contiguous().view(-1)
+            ) #MJ: out.size(-1) specifies the size of the last dimension (often the vocabulary size in sequence-to-sequence tasks).
+              #if out originally has the shape (batch_size, seq_len, vocab_size), 
+              # this operation reshapes it into (batch_size * seq_len, vocab_size). 
+              # This flattening is useful for computing the loss across all tokens in the batch in one go, treating each token as a separate prediction.
+              
+              #if tgt_y initially has a shape like (batch_size, seq_len), tgt_y.contiguous().view(-1) will reshape it
+              # into (batch_size * seq_len,), creating a long 1D tensor of target labels.
+              # This flattening is typically done to match the flattened predictions from out.contiguous().view(-1, out.size(-1))
+              # so that each token prediction in out can be directly compared to its corresponding label in tgt_y for computing the loss.
             / norm
         )
         return sloss.data * norm, sloss
@@ -1030,14 +1045,14 @@ class SimpleLossCompute:
 #             data_iter_gen(V, batch_size, 20),  #MJ: Generate nbatches=20 batches for each epoch
 #             model,..
 def run_epoch(  #MJ: 
-    epoch, is_main_process,
-    batch_generator,
+    epoch, device, is_main_process,
+    data_loader,
     model, #module
     loss_compute,
     optimizer,
     scheduler,
-    mode="train",
-    accum_iter=1,
+    mode="train",  #MJ: or "eval"
+    accum_iter=1, #MJ:   "accum_iter": 10,
     
     # accum_iter: This is the number of iterations (batches) over which gradients are accumulated 
     # before an optimizer step is taken. This is typically used when you want to simulate a larger batch size 
@@ -1056,15 +1071,28 @@ def run_epoch(  #MJ:
     #MJ: for batch in gen:
     #    print(batch)
     #  In place of gen, we can put an iterable, iterator, and generator
-    
-    for i, batch in enumerate(batch_generator):
+    #for i, batch in data_loader_iter:
+        # src = batch["de_ids"].to(device) #MJ: <sos> + src_content + <eos>
+        # trg = batch["en_ids"].to(device) #MJ: <sos> + trg_content + <eos> 
+    #pad_idx = vocab_tgt["<pad>"]    
+    for i, batch in enumerate(data_loader):
         
+        src = batch["de_ids"].to(device) #MJ: <sos> + src_content + <eos>
+        trg = batch["en_ids"].to(device) #MJ: <sos> + trg_content + <eos> 
+        # src = [src length, batch size]
+        # trg = [trg length, batch size]
+        src = src.transpose(0, 1)  # #=>  [batch size, src length]
+        trg = trg.transpose(0, 1)
+        
+        batch_b = Batch(src, trg, pad_index)
+        #def forward(self, src, tgt_x): #MJ: src, tgt:  (batch_size, seq_length); value = index to word
         out = model.forward(
-            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask
-        ) #MJ: batch.tgt = tgt[:,:-1] = the right shifted output = the decoder input
-        # batch.tgt = the decoder input
-        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens) #MJ: batch.tgt_y = tgt[:,1:] = the expected decoder output = the decodeer answers
-        # batch.tgt_y = the decoder target
+            batch_b.src, batch_b.tgt_x)  # , batch_with_mask.src_mask, batch_with_mask.tgt_mask
+         #MJ: batch.tgt_x = tgt[:,:-1] = the right shifted output = the decoder input
+       
+        #MJ: batch.tgt_y = tgt[:,1:] = the expected decoder output = the decodeer answers
+                
+        loss, loss_node = loss_compute(out, batch_b.tgt_y, batch_b.ntokens) #MJ: batch.tgt_y = tgt[:,1:] = the expected decoder output = the decodeer answers
         
         # loss_node = loss_node / accum_iter
         #MJ: Train the network
@@ -1074,8 +1102,8 @@ def run_epoch(  #MJ:
                                   # accumulated automatically
             
             train_state.step += 1
-            train_state.samples += batch.src.shape[0]
-            train_state.tokens += batch.ntokens
+            train_state.samples += batch_b.src.shape[0]
+            train_state.tokens += batch_b.ntokens
             
             #MJ: When i % accum_iter == 0, the accumulated gradients are used to perform an update (via optimizer.step()),
             # and then the gradients are cleared (via optimizer.zero_grad(set_to_none=True)).
@@ -1100,8 +1128,8 @@ def run_epoch(  #MJ:
                 
         #MJ: mode =="eval" or "train"
         total_loss += loss
-        total_tokens += batch.ntokens
-        tokens_since_logging += batch.ntokens
+        total_tokens += batch_b.ntokens
+        tokens_since_logging += batch_b.ntokens
         
         if i % 40 == 1 and (mode == "train" or mode == "train+log"):
         #if i % 2 == 1 and (mode == "train" or mode == "train+log"):
@@ -1112,7 +1140,7 @@ def run_epoch(  #MJ:
                     (
                         "epoch: %d, mode: %s, Step: %6d | Accum Step: %3d | Loss: %6.2f " + "| Tokens/Sec: %7.1f | L-Rate: %6.1e"
                     )
-                    % (epoch, mode, i, n_accum, loss / batch.ntokens, tokens_since_logging / elapsed, lr)
+                    % (epoch, mode, i, n_accum, loss / batch_b.ntokens, tokens_since_logging / elapsed, lr)
                 )
             start = time.time()
             tokens_since_logging = 0
@@ -1133,7 +1161,7 @@ def train_worker(
     is_distributed=False,
 ):
     print(f"Train worker process using GPU: {gpu} for training", flush=True)
-    print(f"Train worker process using mapped GPU: {gpu} (actual GPU: {torch.cuda.current_device()})", flush=True)
+    print(f"Train worker process using mapped GPU: {gpu}", flush=True)
     torch.cuda.set_device(gpu) #MJ: torch.cuda.set_device(gpu) is used to set the default GPU device for PyTorch operations. 
     
     #MJ: After setting CUDA_VISIBLE_DEVICES=1,2,3, only GPUs 1, 2, and 3 are visible to the script.
@@ -1141,7 +1169,7 @@ def train_worker(
     # So when you print the gpu value, it will display 0, 1, and 2, but they actually correspond to GPUs 1, 2, and 3 on your machine.
 
 
-    pad_idx = vocab_tgt["<blank>"]
+    pad_idx = vocab_tgt["<pad>"]
     d_model=512
         
     #def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout,pad=0):
@@ -1172,10 +1200,10 @@ def train_worker(
     # init_method="env://":: "env://" means that the environment variables (like MASTER_ADDR, MASTER_PORT, etc.) will be used to set up communication. These variables are usually set in distributed environments like SLURM or manually in scripts.
     # rank=gpu: The rank is a unique identifier for each process in the distributed system. For example, if you have 4 GPUs (4 processes), the rank will be 0, 1, 2, and 3 for each process.
 
-    criterion = LabelSmoothing(
+    label_smooth_criterion = LabelSmoothing(
         size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
     )
-    criterion.cuda(gpu)
+    label_smooth_criterion.cuda(gpu)
 
     # #MJ: creeate the dataloaders for each gpu
     # train_dataloader, valid_dataloader,_ = create_dataloaders(
@@ -1202,6 +1230,7 @@ def train_worker(
           max_padding=config["max_padding"],
           is_distributed=True)
     
+    
     valid_data_loader = create_dataloader( gpu, valid_data,
         batch_size= config["batch_size"] // ngpus_per_node,
           max_padding=config["max_padding"],
@@ -1219,7 +1248,7 @@ def train_worker(
     train_state = TrainState()
 
     #MJ: The training loop
-    for epoch in range(config["num_epochs"]):
+    for epoch in range(config["num_epochs"]): #MJ = 8
         if is_distributed: 
             #MJ: 1) For the model to train properly, all devices need to shuffle their subsets of data in the same way, but within the subset assigned to each device. This is where set_epoch(epoch) comes in. 
             #2) Different shuffling in each epoch: The set_epoch(epoch) function makes sure that the data is shuffled differently in each epoch by modifying the random seed with the epoch number.
@@ -1230,29 +1259,16 @@ def train_worker(
         model.train()
         print(f"[GPU{gpu}] Epoch {epoch} Training ====", flush=True)
         
-        _, train_state = run_epoch( epoch, is_main_process,
-            
-            #MJ: add pad_idx to each batch from train_data_loader (iterator)
-           
-
-# gen = (x * x for x in range(5))
-# print(type(gen))  # Output: <class 'generator'>
-# ==> () can create either a tuple or a generator depending on the context.
-# Comma-separated values in () create a tuple.
-# Expressions in () like (x for x in iterable) create a generator expression.
-
-#MJ: produce a generator that yields Batch objects, one by one, as it iterates over train_data_loader.
-# An iterator is any object that implements the iterator protocol (__iter__ and __next__), and it may or may not be lazily evaluated.
-# A generator is a simpler and more powerful tool for creating iterators in Python, using a function and yield. It is inherently lazy, meaning it produces values only when needed, saving memory.
-         
-            (Batch(b[0], b[1], pad_idx) for b in train_data_loader),
-            
+        _, train_state = run_epoch( epoch, gpu, is_main_process,
+                      
+            train_data_loader,
+                    
             model, #MJ: ddp_wraped model if distributed training is on
-            SimpleLossCompute(module, criterion), #MJ: module = transformer model itself
+            SimpleLossCompute(label_smooth_criterion), #MJ: module = transformer model itself
             optimizer,
             lr_scheduler,
             mode="train+log",
-            accum_iter=config["accum_iter"],
+            accum_iter=config["accum_iter"], #MJ:   "accum_iter": 10,
             train_state=train_state,
         )
 
@@ -1263,16 +1279,18 @@ def train_worker(
         torch.cuda.empty_cache()
 
         print(f"[GPU{gpu}] Epoch {epoch} Validation ====", flush=True)
+        
         model.eval()
         
-        sloss = run_epoch(epoch, is_main_process,
+        sloss = run_epoch(epoch, gpu, is_main_process,
                           
-            (Batch(b[0], b[1], pad_idx) for b in valid_data_loader),
+            #(Batch(b[0], b[1], pad_idx) for b in valid_data_loader),
+            valid_data_loader,
             model,
-            SimpleLossCompute(module, criterion), #MJ: module refers to the transformer model
+            SimpleLossCompute( label_smooth_criterion), #MJ: module refers to the transformer model
             DummyOptimizer(),
             DummyScheduler(),
-            mode="eval",
+            mode="eval",  #MJ: run_epoch() does not do anything for validation; need to add the code for that
         )
         print(sloss)
         torch.cuda.empty_cache()
@@ -1282,6 +1300,16 @@ def train_worker(
         file_path = "%sfinal.pt" % config["file_prefix"]
         
         torch.save(module.state_dict(), file_path)
+        
+# gen = (x * x for x in range(5))
+# print(type(gen))  # Output: <class 'generator'>
+# ==> () can create either a tuple or a generator depending on the context.
+# Comma-separated values in () create a tuple.
+# Expressions in () like (x for x in iterable) create a generator expression.
+
+#MJ: produce a generator that yields Batch objects, one by one, as it iterates over train_data_loader.
+# An iterator is any object that implements the iterator protocol (__iter__ and __next__), and it may or may not be lazily evaluated.
+# A generator is a simpler and more powerful tool for creating iterators in Python, using a function and yield. It is inherently lazy, meaning it produces values only when needed, saving memory.
 
 # %%
 
@@ -1357,9 +1385,9 @@ def load_trained_model():
         
     #    train_model(de_vocab, en_vocab, config)
 
-    pad_idx = en_vocab["<blank>"]
+    #pad_idx = en_vocab["<pad>"]
     model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
-                        max_seq_length=72, dropout=0.1, pad=pad_idx)
+                        max_seq_length=72, dropout=0.1, pad=pad_index)
    
     model.load_state_dict(
         torch.load( "multi30k_model_final.pt", map_location=torch.device("cpu") )
@@ -1383,7 +1411,7 @@ config = {
         "batch_size": 32,
         #"distributed": False,
         "distributed": True,
-        "num_epochs": 8,
+        "num_epochs": 20, #MJ; default = 8,
         "accum_iter": 10,
         "base_lr": 1.0,
         "max_padding": 72,
@@ -1406,37 +1434,45 @@ def check_outputs(
     pad_idx=2,
     eos_string="<eos>",
 ):
-    results = [()] * n_examples
     
-    for idx in range(n_examples):
+    label_smooth_criterion = LabelSmoothing(
+        size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
+    )
+  
+    compute_loss = SimpleLossCompute( label_smooth_criterion)
+    
+    results = [()] * n_examples  #MJ: [()]*2 = [(),()]
+    
+    for idx in range(n_examples): #MJ: we are going to generate n_examples sentences
         
         print("\nExample %d ========\n" % idx)
         
-        b = next(iter(test_dataloader)) #MJ:  What iter() Does: When you pass an iterable like valid_dataloader to iter(), 
-                                         #it calls valid_dataloader.__iter__(), which returns an iterator over the dataset.
-                                         
-# for batch in valid_dataloader:
-#     # process the batch
-# Python automatically does something like this under the hood:
-
-# valid_iterator = iter(valid_dataloader)
-# while True:
-#     try:
-#         batch = next(valid_iterator)
-#         # process the batch
-#     except StopIteration:
-#         break
-    
+        batch = next(iter(test_dataloader)) #MJ:  What iter() Does: When you pass an iterable like valid_dataloader to iter(), 
+        #MJ: batch from test_dataloader has batch_size = 1  
+        src = batch["de_ids"] #MJ: <sos> + src_content + <eos>
+        trg = batch["en_ids"] #MJ: <sos> + trg_content + <eos> 
+        # src = [src length, batch size]
+        # trg = [trg length, batch size]
+        src = src.transpose(0, 1)  # #=>  [batch size, src length]
+        trg = trg.transpose(0, 1)
         
-        rb = Batch(b[0], b[1], pad_idx)
+        batch_b = Batch(src, trg, pad_index)
+        # out = model.forward(
+        #     batch_with_mask.src, batch_with_mask.tgt, batch_with_mask.src_mask, batch_with_mask.tgt_mask
+            
+            
+        
+       # rb = Batch(b[0], b[1], pad_idx)
         
         #MJ: greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0] #MJ:  ?? greedy_decode(model, src, src_mask, max_len, start_symbol): returns    return ys
-
+        
+        #MJ:  #MJ: batch from test_dataloader has batch_size = 1  
+        
         src_tokens = [
-            vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx
+            vocab_src.get_itos()[x] for x in batch_b.src[0] if x != pad_index
         ]
         tgt_tokens = [
-            vocab_tgt.get_itos()[x] for x in rb.tgt[0] if x != pad_idx
+            vocab_tgt.get_itos()[x] for x in batch_b.tgt_x[0] if x != pad_index
         ] #MJ: get the tokens from only the first element in the batch
 
         print(
@@ -1449,19 +1485,31 @@ def check_outputs(
         )
         
         eos_token = vocab_tgt.get_stoi()[eos_string] #MJ: == 1
-        model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0, end_symbol=eos_token)[0]  #MJ: max_len = 72, 0 = <sos>; rb.src:[2,128]; rb.src_maskL[2,1,128]
+        out_tokens_batch = greedy_decode(model, batch_b.src, 72, 0, end_token=eos_token)
+        model_out = out_tokens_batch[0]
+        #out_prob =  prob_prob_batch[0]
+        #MJ: max_len = 72, 0 = <sos>; rb.src:[2,128]; rb.src_maskL[2,1,128]
+        #MJ: greedy_decode(transformer_model, src, max_len, start_token, end_token)
+        
+        #MJ: out = model.forward(batch_b.src, batch_b.tgt_x)         
+        #loss, loss_node = compute_loss(out_prob, batch_b.tgt_y, batch_b.ntokens) #MJ: batch.tgt_y = tgt[:,1:] = the expected decoder output = the decodeer answers
+        
         
         model_txt = (
             " ".join(
-                [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
+                [vocab_tgt.get_itos()[x] for x in model_out if x != pad_index]
             ).split(eos_string, 1)[0]
             + eos_string
         ) 
-        #MJ: x.split(eos_string, 1) splits x at the first occurrence of the eos_string, which is "</s>"
+        #MJ: x.split(eos_string, 1) splits x at the first occurrence of the eos_string, which is "</s>";  a list of two parts:
         #  This prevents any tokens appearing after the first "</s>" from being included in the output.
         
-        print("Model Output               : " + model_txt.replace("\n", ""))
-        results[idx] = (rb, src_tokens, tgt_tokens, model_out, model_txt)
+        model_txt_no_newline = model_txt.replace('\n', '')
+        print(f"Model Output   : {model_txt_no_newline}")
+   
+        #print(f"Loss per token               : {loss_node}")
+        #results[idx] = (batch_b, src_tokens, tgt_tokens, model_out, model_txt, loss_node)
+        results[idx] = (batch_b, src_tokens, tgt_tokens, model_out, model_txt)
     return results
 
 
@@ -1491,10 +1539,10 @@ def run_model_example(n_examples=5):
 
     print("Loading Trained Model ...")
 
-    pad_idx = en_vocab["<blank>"]
+    #pad_idx = en_vocab["<pad>"]
     
     model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
-                        max_seq_length=72, dropout=0.1, pad=pad_idx)
+                        max_seq_length=72, dropout=0.1, pad=pad_index)
    
     model.load_state_dict(
         torch.load( "multi30k_model_final.pt", map_location=torch.device("cpu") )
@@ -1503,9 +1551,9 @@ def run_model_example(n_examples=5):
     print("Checking Model Outputs:")
     example_data = check_outputs(
         test_dataloader, model, de_vocab, en_vocab, n_examples=n_examples
-    ) #MJ: example_data = (rb, src_tokens, tgt_tokens, model_out, model_txt)
-    # check_outputs(    valid_dataloader,    model,    vocab_src,    vocab_tgt,    n_examples=15,    pad_idx=2,    eos_string="</s>",):
-    # check_outputs calls  model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0)[0]  #MJ: max_len = 72, 0 = <sos>
+    ) #MJ: example_data = (batcg, src_tokens, tgt_tokens, model_out, model_txt, loss_node)
+    # check_outputs calls  model_out = greedy_decode(model, batch_b.src, batch_b.src_mask, 72, 0)[0]  #MJ: max_len = 72, 0 = <sos>
+             
     return model, example_data
 
 
@@ -1546,14 +1594,15 @@ def subsequent_mask(size):
 
 # %%
 def greedy_decode(transformer_model, src, max_len, start_token, end_token):
+    # greedy_decode(model, batch_b.src, 72, 0, end_token=eos_token)
 #greedy_decode(transformer, src_data,  max_gen_seq_length, sos, eos)    
     enc_output = transformer_model.encoder(src)    
-    ys = torch.zeros(1, 1).fill_(start_token).type_as(src)  #MJ: Do not use src.data but use .detach() and/or with torch.no_grad() 
+    ys = torch.zeros(1, 1).fill_(start_token).type_as(src)  #MJ:.x.type_as(src) converts the type of x to that of src, which is a tensor
     #  torch.zeros(1, 1).fill_(start_token) = tensor([[0.]])
-    src_mask = (src != transformer_model.pad).unsqueeze(1).unsqueeze(2)  #MJ: crc: [1, L] => src_mask: [B, 1, 1, L]
+    src_mask = (src != transformer_model.pad).unsqueeze(1).unsqueeze(2)  #MJ: src: [1, L] => src_mask: [1, 1, 1, L]
     
     for i in range(max_len - 1):
-        out = transformer_model.decoder(enc_output, src_mask, ys)  #MJ: src: [1,15], ys: [1,1]; out_prob: [B, 1,11] =[B,location, seq_length]
+        out_prob = transformer_model.decoder(enc_output, src_mask, ys)  #MJ: src: [1,15], ys: [1,1]; out_prob: [B, 1,11] =[B,location, seq_length]
         #print(f"out={out}") #out_prob=torch.Size([1, 1, 11]) => out_prob=torch.Size([1, 2, 11])
         #out_prob=tensor([[[-5.4479, -1.6750,  0.6865,  1.1233,  0.3584,  0.3773,  0.7420,
         #   1.0585, -0.2761,  1.0520,  1.0914]]], grad_fn=<ViewBackward0>)
@@ -1561,7 +1610,7 @@ def greedy_decode(transformer_model, src, max_len, start_token, end_token):
         #    1.0585, -0.2761,  1.0520,  1.0914],
         #  [-5.4578, -1.2135,  0.7173,  0.9492,  0.3095,  0.3843,  0.7443,
         #    1.0394, -0.3098,  0.9794,  1.0174]]], grad_fn=<ViewBackward0>)
-        last_logit = out[:, -1]
+        last_token_prob = out_prob[:, -1] #MJ:out: shape =(1,Curr_len,5893]=(B,Seq,Vocab): -1 refers to the second dim, seq dim
         #MJ: out[:, -1] selects the last time step along the sequence length dimension L
         # meaning you are extracting the features (of size 𝐷) at the last time step for each batch.
         # This operation slices the second dimension (sequence length), 
@@ -1575,22 +1624,24 @@ def greedy_decode(transformer_model, src, max_len, start_token, end_token):
         # (B, D) = (32, 512), meaning you have selected the last token's representation (along the sequence dimension) for each batch.
 
         #print(f"last logit={last_logit}")
-        _, next_word = torch.max(last_logit, dim=1)  
+        _, next_word = torch.max(last_token_prob, dim=1)  #MJ: next_word=tensor([21])
         
         #print(f"next_word={next_word}; shape={next_word.shape}")
                     
     
         # calling y = x.data will be a Tensor that shares the same data with x, is unrelated with the computation history of x, and has requires_grad=False.
-        if next_word == end_token: #MJ next_word =tensor([7]) >
+        if next_word.item() == end_token: #MJ next_word =tensor([7]) >
         #if (next_word == end_token).all():  # All values must be the end token
         #    print(f"reached the <eos> token") 
         #    print(f'ys={ys}')
-           return ys 
+           #return (ys,  out_prob) #MJ:ys:[1,15]; out_prob; [1,15,5893]
+           return ys
         ys = torch.cat(
             [ys, torch.zeros(1, 1).type_as(src).fill_(next_word.item())], dim=1
         ) 
     # print(f"reached the max_seq_length: {max_len}")   
     # print(f'ys={ys}')  
+    #return (ys,  out_prob)
     return ys
 
 # %%
@@ -1802,85 +1853,92 @@ def viz_decoder_src():
     )
 
 if __name__ == '__main__':
-    train_model(de_vocab, en_vocab, config)
+    #train_model(de_vocab, en_vocab, config) 
+    #MJ: epoch: 19, mode: train+log, Step:    961 | Accum Step:  97 | Loss:   1.94 | Tokens/Sec:   649.9 | L-Rate: 3.2e-04
+
    
    
 # %%
 # Run the model using batches with batch-size =1
     run_model_example(n_examples=1) #n_examples = 1  
     
-    pad_idx = en_vocab["<blank>"]
-    model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
-                            max_seq_length=72, dropout=0.1, pad=pad_idx)
-    model.load_state_dict(torch.load("multi30k-transformer.pt"))
-    pad = 0
-    sos = 1
-    eos = 2 
+    # #pad_idx = en_vocab["<pad>"]
+    # model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
+    #                         max_seq_length=72, dropout=0.1, pad=pad_index)
+    # model.load_state_dict(torch.load("multi30k_model_final.pt"))
+    # pad = 0
+    # sos = 1
+    # eos = 2 
 
                                         
-    test_dataloader = create_dataloader(
-            torch.device("cpu"),
-            test_data,
-            batch_size=1, #MJ: the batch size for src and tgt should be 1 in this experiment
-            is_distributed=False,
-        )
+    # test_dataloader = create_dataloader(
+    #         torch.device("cpu"),
+    #         test_data,
+    #         batch_size=1, #MJ: the batch size for src and tgt should be 1 in this experiment
+    #         is_distributed=False,
+    #     )
     
-    # pad_idx = en_vocab["<blank>"]
-    # model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
-    #                         max_seq_length=72, dropout=0.1, pad=pad_idx)
-    # model.load_state_dict(torch.load("multi30k-transformer.pt"))
+    # # pad_idx = en_vocab["<blank>"]
+    # # model = Transformer(len(de_vocab), len(en_vocab), d_model=512, num_heads=8, num_layers=6, d_ff=2048, 
+    # #                         max_seq_length=72, dropout=0.1, pad=pad_idx)
+    # # model.load_state_dict(torch.load("multi30k-transformer.pt"))
 
-    model.eval()  #eval mode: droput layer를 실행안해요.
-    total_loss =0
-    max_seq_length = 72
+    # model.eval()  #eval mode: droput layer를 실행안해요.
+    # total_loss =0
+    # max_seq_length = 72
     
-    with torch.no_grad():
+    # with torch.no_grad():
     
-        for i, batch in enumerate(test_dataloader): #MJ: use an iterator of batches 
-          for j in range( len(batch.src) ): #MJ: = 80
+    #     for i, batch in enumerate(test_dataloader): #MJ: use an iterator of batches with batch_size =1
+    #       src = batch["de_ids"] #MJ: <sos> + src_content + <eos> src.shape=[13,1] = (seq,B)
+    #       trg = batch["en_ids"] #MJ: <sos> + trg_content + <eos> 
+          
+    #       # src = [src length, batch size]
+    #       # trg = [trg length, batch size]
+    #       src = src.transpose(0, 1)  # #=>  [batch size, src length]
+    #       trg = trg.transpose(0, 1)
+        
+    #       batch_b = Batch(src, trg, pad_index) #mj: batch_b is the object with fields, including .src
+       
+        
+    #       for j in range( len(batch_b.src) ): #MJ: = 80 len(src) = 13
                 
-            src_data = batch.src[j][None]  #MJ: [80,15] <==> [1,15], 15 = max_seq_length
+    #         src_data = batch_b.src[j]     #MJ:shape: [10]        
+         
+    #         decoded_seq  = greedy_decode(model, batch_b.src,  max_seq_length, sos, end_token=eos)
+    #         #decoded_seq: [1,72] = [b, seq_length]            
+                        
+    #         decoded_seq  = decoded_seq[0]
             
-            tgt_data_y = batch.tgt_y[j][None]
+    #         print(f"i,j={i,j}: source  seq={src_data}")
+    #         print(f"i,j={i,j}: target   seq={ batch_b.tgt[j]}")
+           
+    #         print(f"i,j={i,j}: decoded seq={ decoded_seq}")
+            
+            
+    # #         diff = (decoded_seq == batch_b.tgt)
+    # #         loss = (diff == False).float().mean()     
         
-            # src_data = batch.src
-            # tgt_data_y = batch.tgt_y
-            decoded_seq  = greedy_decode(model, src_data,  max_seq_length, sos, eos)
-            
-            
-            
-            src_content =  src_data[0][: len(decoded_seq[0]) ]
-            decoded_seq  = decoded_seq[0]
-            
-            print(f"i,j={i,j}: source  seq={src_content}")
-            
-            #print(f"target_y  seq={tgt_data_y[:,:]}")
-            print(f"i,j={i,j}: decoded seq={ decoded_seq}")
-            
-            
-            diff = (decoded_seq == src_content)
-            loss = (diff == False).float().mean()     
-        
-            if loss > 0:
-                print(f'***************************loss nonzero: i,j={i,j}:  loss={loss}') 
-                total_loss += loss
-            #for j in range( len(batch.src) )
-        #for i, batch in enumerate(test_data_iter)      
-    #with torch.no_grad()
-    avg_loss = total_loss / (  len(test_dataloader) * len(batch.src) ) #MJ: / 10*80
-    print(f'tut-transformer:total_loss={total_loss},len(test_data_iter) * len(batch.src)={len(test_dataloader) * len(batch.src)}, avg_loss={avg_loss}')  
+    # #         if loss > 0:
+    # #             print(f'***************************loss nonzero: i,j={i,j}:  loss={loss}') 
+    # #             total_loss += loss
+    # #         #for j in range( len(batch.src) )
+    # #     #for i, batch in enumerate(test_data_iter)      
+    # # #with torch.no_grad()
+    # # avg_loss = total_loss / (  len(test_dataloader) * test_dataloader.batch_size ) #MJ: / 10*80
+    # # print(f'tut-transformer:total_loss={total_loss},len(test_data_iter) * len(batch.src)={len(test_dataloader) * test_dataloader.batch_size}, avg_loss={avg_loss}')  
        
 
     # %%
-    viz_encoder_self()
+    #viz_encoder_self()
 
 
     # %%
-    viz_decoder_self()
+    #viz_decoder_self()
 
 
 
     # %%
-    viz_decoder_src()  #MJ: decoder cross attention
+    #viz_decoder_src()  #MJ: decoder cross attention
 #if __name__ == '__main__':
 
